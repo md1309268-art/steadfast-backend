@@ -1,67 +1,21 @@
-# Steadfast Backend for Order Hisab App
+# Steadfast Frontend Fix
 
-This small Flask API keeps the Steadfast API Key and Secret Key on the server, not inside the HTML app.
+This is a replacement HTML/JS frontend because the uploaded backend ZIP did not contain the original HTML/JS files.
 
-## 1. Install
+## Fixes
+- Loads Steadfast police stations through the backend proxy.
+- Filters Thana/Police Station after District selection.
+- Sends `district` and `thana` to `/steadfast/order`.
+- Clears only the current form after a successful entry; existing saved orders are not deleted.
+- Prevents double submit while an entry is being sent.
 
-```bash
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/macOS:
-source .venv/bin/activate
+## Backend URL
+`app.js` defaults to:
+`https://steadfast-backend-production-1e9b.up.railway.app`
 
-pip install -r requirements.txt
-```
+You can change it in `app.js`, or in the browser console:
+`localStorage.setItem('STEADFAST_BACKEND_URL', 'YOUR_BACKEND_URL')`
+then reload.
 
-## 2. Configure
-
-Copy `.env.example` to `.env` and put your Steadfast API credentials there.
-
-Do NOT put the API key/secret in the HTML file or share them in chat.
-
-## 3. Run
-
-```bash
-python app.py
-```
-
-The backend will listen on:
-`http://127.0.0.1:5000`
-
-Health check:
-`GET /health`
-
-Order endpoint:
-`POST /steadfast/order`
-
-## 4. Connect the HTML app
-
-In the updated HTML app, set the Steadfast backend URL to:
-
-`http://YOUR_SERVER_IP:5000/steadfast/order`
-
-If the HTML is opened from a different device/network, use a public HTTPS backend URL instead.
-
-## Order JSON accepted
-
-```json
-{
-  "invoice": "ORD-1001",
-  "customer_name": "Customer Name",
-  "customer_phone": "01712345678",
-  "delivery_address": "House/Road/Area | Thana, District",
-  "cod_amount": 1200,
-  "product": "Product name",
-  "quantity": 1
-}
-```
-
-The backend maps these to Steadfast's create-order fields and returns the consignment ID and tracking code.
-
-## Production notes
-
-- Use HTTPS.
-- Restrict CORS to your actual app origin instead of `*`.
-- Add your own authentication/rate limit before exposing this endpoint publicly.
-- Keep `.env` private and never commit it to Git.
+## Important
+Steadfast's documented `create_order` endpoint has `recipient_address` rather than separate District/Thana order fields. The backend therefore includes the selected District/Thana in the address and note. The `/police_stations` endpoint is used for the selection list.
