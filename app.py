@@ -1,600 +1,914 @@
-import os
-import re
+// ======================================================
+// STEADFAST BACKEND URL
+// ======================================================
 
-from flask import Flask, request, jsonify
-import requests
-from flask_cors import CORS
-from dotenv import load_dotenv
-
-
-# =========================================================
-# LOAD ENVIRONMENT
-# =========================================================
-
-load_dotenv()
-
-app = Flask(__name__)
-
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    supports_credentials=False
-)
+const API_BASE =
+  localStorage.getItem('STEADFAST_BACKEND_URL') ||
+  'https://steadfast-backend-production-1e9b.up.railway.app';
 
 
-# =========================================================
-# STEADFAST CONFIG
-# =========================================================
+// ======================================================
+// ELEMENTS
+// ======================================================
 
-STEADFAST_BASE_URL = os.getenv(
-    "STEADFAST_BASE_URL",
-    "https://portal.packzy.com/api/v1"
-).rstrip("/")
+const $ = (id) => document.getElementById(id);
 
-API_KEY = os.getenv("STEADFAST_API_KEY", "")
-SECRET_KEY = os.getenv("STEADFAST_SECRET_KEY", "")
-
-PORT = int(os.getenv("PORT", "5000"))
+const form = $('orderForm');
+const districtEl = $('district');
+const thanaEl = $('thana');
+const messageEl = $('message');
+const submitBtn = $('submitBtn');
 
 
-# =========================================================
-# COMMON FUNCTIONS
-# =========================================================
+// ======================================================
+// MESSAGE
+// ======================================================
 
-def clean(value):
-    return str(value or "").strip()
+function showMessage(text, ok = false) {
+
+  messageEl.textContent = text;
+
+  messageEl.className =
+    'msg ' + (ok ? 'ok' : 'err');
+
+  messageEl.style.display = 'block';
+}
 
 
-def clean_phone(phone):
-    return re.sub(r"\D", "", str(phone or ""))
+function hideMessage() {
+  messageEl.style.display = 'none';
+}
 
 
-def steadfast_headers():
-    return {
-        "Api-Key": API_KEY,
-        "Secret-Key": SECRET_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+// ======================================================
+// CLEAN VALUE
+// ======================================================
+
+function clean(value) {
+  return String(value ?? '').trim();
+}
+
+
+// ======================================================
+// EXTRACT POLICE STATIONS
+// ======================================================
+//
+// Steadfast response বিভিন্নভাবে আসতে পারে।
+// তাই এখানে কয়েকটি possible response format support করা হয়েছে.
+// ======================================================
+
+function extractStations(payload) {
+
+  let raw = [];
+
+  if (Array.isArray(payload)) {
+    raw = payload;
+  }
+
+  else if (Array.isArray(payload.stations)) {
+    raw = payload.stations;
+  }
+
+  else if (Array.isArray(payload.police_stations)) {
+    raw = payload.police_stations;
+  }
+
+  else if (Array.isArray(payload.data)) {
+    raw = payload.data;
+  }
+
+  else if (payload.data && Array.isArray(payload.data.data)) {
+    raw = payload.data.data;
+  }
+
+  else if (payload.data && Array.isArray(payload.data.stations)) {
+    raw = payload.data.stations;
+  }
+
+  else if (payload.data && Array.isArray(payload.data.police_stations)) {
+    raw = payload.data.police_stations;
+  }
+
+
+  return raw
+    .map(item => {
+
+      // যদি শুধু string হয়
+      if (typeof item === 'string') {
+
+        return {
+          name: clean(item),
+          district: ''
+        };
+      }
+
+
+      // যদি object হয়
+      return {
+
+        name: clean(
+          item.name ??
+          item.police_station ??
+          item.police_station_name ??
+          item.station_name ??
+          item.thana ??
+          item.thana_name ??
+          item.upazila ??
+          item.upazila_name ??
+          item.title
+        ),
+
+        district: clean(
+          item.district ??
+          item.district_name ??
+          item.city ??
+          item.city_name ??
+          item.division ??
+          ''
+        )
+
+      };
+
+    })
+
+    .filter(item => item.name);
+}
+
+
+// ======================================================
+// ALL STATIONS
+// ======================================================
+
+let stations = [];
+
+
+// ======================================================
+// NORMALIZE BANGLA / ENGLISH TEXT
+// ======================================================
+
+function normalizeText(value) {
+
+  return clean(value)
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+}
+
+
+// ======================================================
+// LOAD DISTRICT + THANA
+// ======================================================
+
+async function loadStations() {
+
+  districtEl.innerHTML =
+    '<option value="">জেলা নির্বাচন করুন</option>';
+
+  thanaEl.innerHTML =
+    '<option value="">আগে জেলা নির্বাচন করুন</option>';
+
+  thanaEl.disabled = true;
+
+  stations = [];
+
+
+  try {
+
+    const response = await fetch(
+      API_BASE + '/steadfast/police_stations',
+      {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json'
+        }
+      }
+    );
+
+
+    let payload;
+
+    try {
+      payload = await response.json();
+    }
+
+    catch (jsonError) {
+
+      throw new Error(
+        'Backend থেকে সঠিক JSON response পাওয়া যায়নি।'
+      );
     }
 
 
-def credentials_ok():
-    return bool(API_KEY and SECRET_KEY)
-
-
-# =========================================================
-# ORDER VALIDATION
-# =========================================================
-
-def validate_order(data):
-
-    required = [
-        "invoice",
-        "customer_name",
-        "customer_phone",
-        "delivery_address",
-        "district",
-        "thana",
-        "cod_amount",
-    ]
-
-    missing = []
-
-    for field in required:
-        value = data.get(field)
-
-        if value is None or clean(value) == "":
-            missing.append(field)
-
-    if missing:
-        return "Missing fields: " + ", ".join(missing)
-
-    # -----------------------------------------------------
-    # PHONE
-    # -----------------------------------------------------
-
-    phone = clean_phone(data.get("customer_phone"))
-
-    if len(phone) != 11 or not phone.startswith("01"):
-        return "customer_phone must be an 11-digit Bangladesh mobile number."
-
-    # -----------------------------------------------------
-    # COD
-    # -----------------------------------------------------
-
-    try:
-        cod = float(data.get("cod_amount"))
-
-        if cod < 0:
-            return "cod_amount must be >= 0."
-
-    except (TypeError, ValueError):
-        return "cod_amount must be a number."
-
-    # -----------------------------------------------------
-    # LENGTH VALIDATION
-    # -----------------------------------------------------
-
-    if len(clean(data.get("invoice"))) > 100:
-        return "invoice is too long."
-
-    if len(clean(data.get("customer_name"))) > 100:
-        return "customer_name is too long."
-
-    if len(clean(data.get("delivery_address"))) > 250:
-        return "delivery_address is too long (max 250 characters)."
-
-    if len(clean(data.get("district"))) > 100:
-        return "district is too long."
-
-    if len(clean(data.get("thana"))) > 100:
-        return "thana is too long."
-
-    return None
-
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
-
-@app.get("/")
-def home():
-
-    return jsonify({
-        "ok": True,
-        "service": "steadfast-backend",
-        "message": "Steadfast backend is running."
-    })
-
-
-@app.get("/health")
-def health():
-
-    return jsonify({
-        "ok": True,
-        "service": "steadfast-backend",
-        "credentials_configured": credentials_ok(),
-        "base_url": STEADFAST_BASE_URL
-    })
-
-
-# =========================================================
-# DISTRICT + THANA / POLICE STATIONS
-# =========================================================
-
-@app.get("/steadfast/police_stations")
-def police_stations():
-
-    if not credentials_ok():
-
-        return jsonify({
-            "ok": False,
-            "message": "Steadfast API credentials are not configured on the server."
-        }), 500
-
-    try:
-
-        response = requests.get(
-            f"{STEADFAST_BASE_URL}/police_stations",
-            headers=steadfast_headers(),
-            timeout=30
-        )
-
-        # -------------------------------------------------
-        # TRY JSON
-        # -------------------------------------------------
-
-        try:
-            result = response.json()
-
-        except ValueError:
-
-            return jsonify({
-                "ok": False,
-                "message": "Steadfast returned a non-JSON response.",
-                "status_code": response.status_code,
-                "raw": response.text[:2000]
-            }), response.status_code
-
-        # -------------------------------------------------
-        # STEADFAST ERROR
-        # -------------------------------------------------
-
-        if not response.ok:
-
-            return jsonify({
-                "ok": False,
-                "message": "Steadfast police station request failed.",
-                "steadfast_status": response.status_code,
-                "details": result
-            }), response.status_code
-
-        # -------------------------------------------------
-        # NORMAL RESPONSE
-        # -------------------------------------------------
-
-        return jsonify(result), response.status_code
-
-    except requests.RequestException as e:
-
-        return jsonify({
-            "ok": False,
-            "message": "Could not reach Steadfast police station API.",
-            "error": str(e)
-        }), 502
-
-
-# =========================================================
-# CREATE STEADFAST ORDER
-# =========================================================
-
-@app.post("/steadfast/order")
-def create_order():
-
-    if not credentials_ok():
-
-        return jsonify({
-            "ok": False,
-            "message": "Steadfast API credentials are not configured on the server."
-        }), 500
-
-    data = request.get_json(silent=True) or {}
-
-    # -----------------------------------------------------
-    # VALIDATE
-    # -----------------------------------------------------
-
-    error = validate_order(data)
-
-    if error:
-
-        return jsonify({
-            "ok": False,
-            "message": error
-        }), 400
-
-    # -----------------------------------------------------
-    # ADDRESS
-    #
-    # Steadfast's create_order API requires one
-    # recipient_address field.
-    #
-    # We combine:
-    # District + Thana + user's address
-    #
-    # Example:
-    # Cox's Bazar, Ramu, Notun Bari
-    # -----------------------------------------------------
-
-    district = clean(data.get("district"))
-    thana = clean(data.get("thana"))
-    address = clean(data.get("delivery_address"))
-
-    full_address = f"{address} | {thana}, {district}"
-
-    # Steadfast max address length is 250 characters.
-    if len(full_address) > 250:
-
-        return jsonify({
-            "ok": False,
-            "message": "Combined delivery address is longer than 250 characters."
-        }), 400
-
-    # -----------------------------------------------------
-    # MAIN PAYLOAD
-    # -----------------------------------------------------
-
-    payload = {
-        "invoice": clean(data.get("invoice")),
-
-        "recipient_name": clean(
-            data.get("customer_name")
-        ),
-
-        "recipient_phone": clean_phone(
-            data.get("customer_phone")
-        ),
-
-        "recipient_address": full_address,
-
-        "cod_amount": float(
-            data.get("cod_amount") or 0
-        ),
+    if (!response.ok) {
+
+      throw new Error(
+        payload.message ||
+        'District/Thana API failed.'
+      );
     }
 
-    # -----------------------------------------------------
-    # OPTIONAL FIELDS
-    # -----------------------------------------------------
 
-    optional_fields = [
-        "alternative_phone",
-        "recipient_email",
-        "note",
-        "item_description",
-        "total_lot",
-        "delivery_type",
-    ]
+    stations = extractStations(payload);
 
-    for field in optional_fields:
 
-        value = data.get(field)
+    // -----------------------------------------------
+    // যদি station data না আসে
+    // -----------------------------------------------
 
-        if value not in (None, ""):
+    if (!stations.length) {
 
-            if field == "alternative_phone":
+      throw new Error(
+        'Steadfast থেকে District/Thana data পাওয়া যায়নি।'
+      );
+    }
 
-                payload[field] = clean_phone(value)
 
-            else:
+    // -----------------------------------------------
+    // District তৈরি
+    // -----------------------------------------------
 
-                payload[field] = value
+    const districtMap = new Map();
 
-    # -----------------------------------------------------
-    # SEND TO STEADFAST
-    # -----------------------------------------------------
 
-    try:
+    stations.forEach(station => {
 
-        response = requests.post(
-            f"{STEADFAST_BASE_URL}/create_order",
-            headers=steadfast_headers(),
-            json=payload,
-            timeout=30
+      const district = clean(station.district);
+
+      if (!district) return;
+
+
+      const key = normalizeText(district);
+
+      if (!districtMap.has(key)) {
+
+        districtMap.set(key, district);
+      }
+
+    });
+
+
+    const districts =
+      Array.from(districtMap.values())
+        .sort((a, b) =>
+          a.localeCompare(b, 'bn')
+        );
+
+
+    // -----------------------------------------------
+    // District dropdown
+    // -----------------------------------------------
+
+    districts.forEach(district => {
+
+      districtEl.add(
+        new Option(
+          district,
+          district
         )
+      );
 
-        # -------------------------------------------------
-        # JSON RESPONSE
-        # -------------------------------------------------
-
-        try:
-            result = response.json()
-
-        except ValueError:
-
-            return jsonify({
-                "ok": False,
-                "message": "Steadfast returned a non-JSON response.",
-                "steadfast_status": response.status_code,
-                "raw": response.text[:3000]
-            }), response.status_code
-
-        # -------------------------------------------------
-        # STEADFAST ERROR
-        # -------------------------------------------------
-
-        if not response.ok:
-
-            return jsonify({
-                "ok": False,
-                "message": "Steadfast API request failed.",
-                "steadfast_status": response.status_code,
-                "details": result
-            }), response.status_code
-
-        # -------------------------------------------------
-        # CONSIGNMENT
-        # -------------------------------------------------
-
-        consignment = result.get("consignment") or {}
-
-        return jsonify({
-
-            "ok": True,
-
-            "message": result.get(
-                "message",
-                "Order created successfully."
-            ),
-
-            "consignment_id": consignment.get(
-                "consignment_id"
-            ),
-
-            "tracking_code": consignment.get(
-                "tracking_code"
-            ),
-
-            "status": consignment.get(
-                "status"
-            ),
-
-            "consignment": consignment,
-
-            # Keep these so frontend can confirm
-            # what was actually sent.
-            "district": district,
-
-            "thana": thana,
-
-            "recipient_address": full_address
-
-        }), response.status_code
-
-    except requests.RequestException as e:
-
-        return jsonify({
-            "ok": False,
-            "message": "Could not reach Steadfast.",
-            "error": str(e)
-        }), 502
+    });
 
 
-# =========================================================
-# STATUS BY INVOICE
-# =========================================================
+    if (!districts.length) {
 
-@app.get("/steadfast/status/invoice/<path:invoice>")
-def status_by_invoice(invoice):
+      throw new Error(
+        'Station data এসেছে, কিন্তু District mapping পাওয়া যায়নি।'
+      );
+    }
 
-    if not credentials_ok():
 
-        return jsonify({
-            "ok": False,
-            "message": "Steadfast API credentials are not configured on the server."
-        }), 500
+    showMessage(
+      'District ও Thana list সফলভাবে লোড হয়েছে।',
+      true
+    );
 
-    try:
 
-        response = requests.get(
-            f"{STEADFAST_BASE_URL}/status_by_invoice/{invoice}",
-            headers=steadfast_headers(),
-            timeout=30
+    // কয়েক সেকেন্ড পরে message hide
+    setTimeout(() => {
+
+      if (messageEl.textContent.includes('District')) {
+        hideMessage();
+      }
+
+    }, 3000);
+
+
+  }
+
+  catch (error) {
+
+    console.error(
+      'District/Thana Load Error:',
+      error
+    );
+
+
+    showMessage(
+      'District/Thana লোড হয়নি: ' +
+      error.message
+    );
+  }
+
+}
+
+
+// ======================================================
+// DISTRICT CHANGE
+// ======================================================
+
+districtEl.addEventListener(
+  'change',
+  function () {
+
+    const selectedDistrict =
+      clean(this.value);
+
+
+    // -----------------------------------------------
+    // Thana reset
+    // -----------------------------------------------
+
+    thanaEl.innerHTML =
+      '<option value="">থানা নির্বাচন করুন</option>';
+
+    thanaEl.disabled = true;
+
+
+    if (!selectedDistrict) {
+      return;
+    }
+
+
+    const selectedDistrictKey =
+      normalizeText(selectedDistrict);
+
+
+    // -----------------------------------------------
+    // Selected district-এর Thana বের করা
+    // -----------------------------------------------
+
+    const thanaMap = new Map();
+
+
+    stations.forEach(station => {
+
+      const stationDistrict =
+        normalizeText(station.district);
+
+
+      if (
+        stationDistrict === selectedDistrictKey
+      ) {
+
+        const thana =
+          clean(station.name);
+
+
+        if (!thana) return;
+
+
+        const key =
+          normalizeText(thana);
+
+
+        if (!thanaMap.has(key)) {
+
+          thanaMap.set(key, thana);
+        }
+
+      }
+
+    });
+
+
+    const thanas =
+      Array.from(thanaMap.values())
+        .sort((a, b) =>
+          a.localeCompare(b, 'bn')
+        );
+
+
+    // -----------------------------------------------
+    // Thana dropdown
+    // -----------------------------------------------
+
+    thanas.forEach(thana => {
+
+      thanaEl.add(
+        new Option(
+          thana,
+          thana
         )
+      );
 
-        try:
-            result = response.json()
-
-        except ValueError:
-
-            result = {
-                "raw": response.text
-            }
-
-        return jsonify(result), response.status_code
-
-    except requests.RequestException as e:
-
-        return jsonify({
-            "ok": False,
-            "message": "Could not reach Steadfast.",
-            "error": str(e)
-        }), 502
+    });
 
 
-# =========================================================
-# STATUS BY TRACKING CODE
-# =========================================================
+    if (thanas.length) {
 
-@app.get("/steadfast/status/tracking/<tracking_code>")
-def status_by_tracking(tracking_code):
+      thanaEl.disabled = false;
 
-    if not credentials_ok():
+    }
 
-        return jsonify({
-            "ok": False,
-            "message": "Steadfast API credentials are not configured on the server."
-        }), 500
+    else {
 
-    try:
+      thanaEl.innerHTML =
+        '<option value="">এই জেলার থানা পাওয়া যায়নি</option>';
 
-        response = requests.get(
-            f"{STEADFAST_BASE_URL}/status_by_trackingcode/{tracking_code}",
-            headers=steadfast_headers(),
-            timeout=30
-        )
+      thanaEl.disabled = true;
 
-        try:
-            result = response.json()
+    }
 
-        except ValueError:
-
-            result = {
-                "raw": response.text
-            }
-
-        return jsonify(result), response.status_code
-
-    except requests.RequestException as e:
-
-        return jsonify({
-            "ok": False,
-            "message": "Could not reach Steadfast.",
-            "error": str(e)
-        }), 502
+  }
+);
 
 
-# =========================================================
-# STATUS BY CONSIGNMENT ID
-# =========================================================
+// ======================================================
+// FORM DATA
+// ======================================================
 
-@app.get("/steadfast/status/cid/<int:consignment_id>")
-def status_by_cid(consignment_id):
+function getFormData() {
 
-    if not credentials_ok():
+  return {
 
-        return jsonify({
-            "ok": False,
-            "message": "Steadfast API credentials are not configured on the server."
-        }), 500
+    invoice:
+      clean($('invoice').value),
 
-    try:
+    customer_name:
+      clean($('customer_name').value),
 
-        response = requests.get(
-            f"{STEADFAST_BASE_URL}/status_by_cid/{consignment_id}",
-            headers=steadfast_headers(),
-            timeout=30
-        )
+    customer_phone:
+      clean($('customer_phone').value),
 
-        try:
-            result = response.json()
+    delivery_address:
+      clean($('delivery_address').value),
 
-        except ValueError:
+    district:
+      clean(districtEl.value),
 
-            result = {
-                "raw": response.text
-            }
+    thana:
+      clean(thanaEl.value),
 
-        return jsonify(result), response.status_code
+    cod_amount:
+      Number(
+        $('cod_amount').value || 0
+      ),
 
-    except requests.RequestException as e:
+    item_description:
+      clean($('item_description').value),
 
-        return jsonify({
-            "ok": False,
-            "message": "Could not reach Steadfast.",
-            "error": str(e)
-        }), 502
+    total_lot:
+      Number(
+        $('total_lot').value || 1
+      ),
 
+    note:
+      clean($('note').value)
 
-# =========================================================
-# BALANCE
-# =========================================================
+  };
 
-@app.get("/steadfast/balance")
-def balance():
-
-    if not credentials_ok():
-
-        return jsonify({
-            "ok": False,
-            "message": "Steadfast API credentials are not configured on the server."
-        }), 500
-
-    try:
-
-        response = requests.get(
-            f"{STEADFAST_BASE_URL}/get_balance",
-            headers=steadfast_headers(),
-            timeout=30
-        )
-
-        try:
-            result = response.json()
-
-        except ValueError:
-
-            result = {
-                "raw": response.text
-            }
-
-        return jsonify(result), response.status_code
-
-    except requests.RequestException as e:
-
-        return jsonify({
-            "ok": False,
-            "message": "Could not reach Steadfast.",
-            "error": str(e)
-        }), 502
+}
 
 
-# =========================================================
-# RUN
-# =========================================================
+// ======================================================
+// RESET FORM AFTER SUCCESS
+// ======================================================
 
-if __name__ == "__main__":
+function resetAfterSuccess() {
 
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False
-    )
+  // পুরো form clear
+  form.reset();
+
+
+  // District আবার প্রথম option
+  districtEl.value = '';
+
+
+  // Thana reset
+  thanaEl.innerHTML =
+    '<option value="">আগে জেলা নির্বাচন করুন</option>';
+
+  thanaEl.disabled = true;
+
+
+  // Default values
+  $('cod_amount').value = '0';
+
+  $('total_lot').value = '1';
+
+
+  // Invoice field-এ cursor
+  setTimeout(() => {
+
+    $('invoice').focus();
+
+  }, 100);
+
+}
+
+
+// ======================================================
+// SUBMIT ORDER
+// ======================================================
+
+form.addEventListener(
+  'submit',
+  async function (event) {
+
+    event.preventDefault();
+
+    hideMessage();
+
+
+    const data =
+      getFormData();
+
+
+    // -----------------------------------------------
+    // District validation
+    // -----------------------------------------------
+
+    if (!data.district) {
+
+      showMessage(
+        'দয়া করে জেলা নির্বাচন করুন।'
+      );
+
+      districtEl.focus();
+
+      return;
+    }
+
+
+    // -----------------------------------------------
+    // Thana validation
+    // -----------------------------------------------
+
+    if (!data.thana) {
+
+      showMessage(
+        'দয়া করে থানা নির্বাচন করুন।'
+      );
+
+      thanaEl.focus();
+
+      return;
+    }
+
+
+    // -----------------------------------------------
+    // Phone validation
+    // -----------------------------------------------
+
+    if (
+      !/^01\d{9}$/.test(
+        data.customer_phone
+      )
+    ) {
+
+      showMessage(
+        'সঠিক ১১ সংখ্যার মোবাইল নম্বর দিন।'
+      );
+
+      $('customer_phone').focus();
+
+      return;
+    }
+
+
+    // -----------------------------------------------
+    // COD validation
+    // -----------------------------------------------
+
+    if (
+      Number.isNaN(data.cod_amount) ||
+      data.cod_amount < 0
+    ) {
+
+      showMessage(
+        'সঠিক COD Amount দিন।'
+      );
+
+      $('cod_amount').focus();
+
+      return;
+    }
+
+
+    // -----------------------------------------------
+    // Address validation
+    // -----------------------------------------------
+
+    if (!data.delivery_address) {
+
+      showMessage(
+        'সম্পূর্ণ ঠিকানা দিন।'
+      );
+
+      $('delivery_address').focus();
+
+      return;
+    }
+
+
+    // -----------------------------------------------
+    // Disable button
+    // -----------------------------------------------
+
+    submitBtn.disabled = true;
+
+
+    const btnText =
+      $('btnText');
+
+    const spinner =
+      $('spinner');
+
+
+    if (btnText) {
+      btnText.style.display = 'none';
+    }
+
+
+    if (spinner) {
+      spinner.style.display = 'inline';
+    }
+
+
+    try {
+
+      // ---------------------------------------------
+      // Send order
+      // ---------------------------------------------
+
+      const response =
+        await fetch(
+          API_BASE + '/steadfast/order',
+          {
+
+            method: 'POST',
+
+            headers: {
+              'Content-Type':
+                'application/json',
+
+              'Accept':
+                'application/json'
+            },
+
+            body:
+              JSON.stringify(data)
+
+          }
+        );
+
+
+      // ---------------------------------------------
+      // Response JSON
+      // ---------------------------------------------
+
+      let result;
+
+      try {
+
+        result =
+          await response.json();
+
+      }
+
+      catch (jsonError) {
+
+        throw new Error(
+          'Backend থেকে সঠিক response পাওয়া যায়নি।'
+        );
+      }
+
+
+      // ---------------------------------------------
+      // Error response
+      // ---------------------------------------------
+
+      if (
+        !response.ok ||
+        !result.ok
+      ) {
+
+        let errorMessage =
+          result.message ||
+          result.details?.message ||
+          'Steadfast Entry failed.';
+
+
+        // Steadfast API error থাকলে
+        if (
+          result.details &&
+          typeof result.details === 'object'
+        ) {
+
+          const details =
+            result.details;
+
+
+          if (details.message) {
+
+            errorMessage =
+              details.message;
+
+          }
+
+          else if (details.errors) {
+
+            errorMessage =
+              JSON.stringify(
+                details.errors
+              );
+
+          }
+
+        }
+
+
+        throw new Error(
+          errorMessage
+        );
+      }
+
+
+      // ---------------------------------------------
+      // SUCCESS
+      // ---------------------------------------------
+
+      const tracking =
+        result.tracking_code
+          ? ' Tracking: ' +
+            result.tracking_code
+          : '';
+
+
+      const consignmentId =
+        result.consignment_id
+          ? ' Consignment ID: ' +
+            result.consignment_id
+          : '';
+
+
+      // ---------------------------------------------
+      // প্রথমে success message
+      // ---------------------------------------------
+
+      showMessage(
+        '✅ Steadfast Entry সফল হয়েছে।' +
+        tracking +
+        consignmentId,
+        true
+      );
+
+
+      // ---------------------------------------------
+      // তারপর form clear
+      // ---------------------------------------------
+
+      resetAfterSuccess();
+
+
+    }
+
+    catch (error) {
+
+      console.error(
+        'Steadfast Entry Error:',
+        error
+      );
+
+
+      // ---------------------------------------------
+      // Failed to fetch
+      // ---------------------------------------------
+
+      if (
+        error.message ===
+        'Failed to fetch'
+      ) {
+
+        showMessage(
+          '❌ Backend-এর সাথে connection হচ্ছে না। ' +
+          'Railway URL, Deployment এবং CORS check করুন।'
+        );
+
+      }
+
+      else {
+
+        showMessage(
+          '❌ Steadfast Entry হয়নি: ' +
+          error.message
+        );
+
+      }
+
+    }
+
+    finally {
+
+      // ---------------------------------------------
+      // Enable button
+      // ---------------------------------------------
+
+      submitBtn.disabled = false;
+
+
+      if (btnText) {
+        btnText.style.display = 'inline';
+      }
+
+
+      if (spinner) {
+        spinner.style.display = 'none';
+      }
+
+    }
+
+  }
+);
+
+
+// ======================================================
+// BACKEND CONNECTION CHECK
+// ======================================================
+
+async function checkBackend() {
+
+  try {
+
+    const response =
+      await fetch(
+        API_BASE + '/health',
+        {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json'
+          }
+        }
+      );
+
+
+    const result =
+      await response.json();
+
+
+    console.log(
+      'Steadfast Backend:',
+      result
+    );
+
+
+    if (!response.ok || !result.ok) {
+
+      showMessage(
+        'Backend connection ঠিক নেই।'
+      );
+
+      return false;
+    }
+
+
+    return true;
+
+  }
+
+  catch (error) {
+
+    console.error(
+      'Backend Check Error:',
+      error
+    );
+
+    showMessage(
+      'Backend-এর সাথে connection হচ্ছে না।'
+    );
+
+    return false;
+  }
+
+}
+
+
+// ======================================================
+// START
+// ======================================================
+
+(async function () {
+
+  const connected =
+    await checkBackend();
+
+
+  if (connected) {
+
+    await loadStations();
+
+  }
+
+})();
