@@ -6,14 +6,21 @@ import requests
 from flask_cors import CORS
 from dotenv import load_dotenv
 
+
+# =========================================================
+# LOAD ENVIRONMENT
+# =========================================================
+
 load_dotenv()
 
 app = Flask(__name__)
 
 CORS(
     app,
-    resources={r"/*": {"origins": "*"}}
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False
 )
+
 
 # =========================================================
 # STEADFAST CONFIG
@@ -31,7 +38,7 @@ PORT = int(os.getenv("PORT", "5000"))
 
 
 # =========================================================
-# HELPERS
+# COMMON FUNCTIONS
 # =========================================================
 
 def clean(value):
@@ -51,40 +58,52 @@ def steadfast_headers():
     }
 
 
+def credentials_ok():
+    return bool(API_KEY and SECRET_KEY)
+
+
 # =========================================================
-# VALIDATION
+# ORDER VALIDATION
 # =========================================================
 
 def validate_order(data):
-
-    # District / Thana এখানে required করছি না।
-    # কারণ Steadfast create_order API-তে এগুলো আলাদা
-    # required field নয়।
 
     required = [
         "invoice",
         "customer_name",
         "customer_phone",
         "delivery_address",
+        "district",
+        "thana",
         "cod_amount",
     ]
 
-    missing = [
-        field
-        for field in required
-        if data.get(field) in (None, "")
-    ]
+    missing = []
+
+    for field in required:
+        value = data.get(field)
+
+        if value is None or clean(value) == "":
+            missing.append(field)
 
     if missing:
-        return f"Missing fields: {', '.join(missing)}"
+        return "Missing fields: " + ", ".join(missing)
 
-    phone = clean_phone(data["customer_phone"])
+    # -----------------------------------------------------
+    # PHONE
+    # -----------------------------------------------------
+
+    phone = clean_phone(data.get("customer_phone"))
 
     if len(phone) != 11 or not phone.startswith("01"):
         return "customer_phone must be an 11-digit Bangladesh mobile number."
 
+    # -----------------------------------------------------
+    # COD
+    # -----------------------------------------------------
+
     try:
-        cod = float(data["cod_amount"])
+        cod = float(data.get("cod_amount"))
 
         if cod < 0:
             return "cod_amount must be >= 0."
@@ -92,14 +111,24 @@ def validate_order(data):
     except (TypeError, ValueError):
         return "cod_amount must be a number."
 
-    if len(str(data["invoice"])) > 100:
+    # -----------------------------------------------------
+    # LENGTH VALIDATION
+    # -----------------------------------------------------
+
+    if len(clean(data.get("invoice"))) > 100:
         return "invoice is too long."
 
-    if len(str(data["customer_name"])) > 100:
+    if len(clean(data.get("customer_name"))) > 100:
         return "customer_name is too long."
 
-    if len(str(data["delivery_address"])) > 250:
+    if len(clean(data.get("delivery_address"))) > 250:
         return "delivery_address is too long (max 250 characters)."
+
+    if len(clean(data.get("district"))) > 100:
+        return "district is too long."
+
+    if len(clean(data.get("thana"))) > 100:
+        return "thana is too long."
 
     return None
 
@@ -108,30 +137,39 @@ def validate_order(data):
 # HEALTH CHECK
 # =========================================================
 
+@app.get("/")
+def home():
+
+    return jsonify({
+        "ok": True,
+        "service": "steadfast-backend",
+        "message": "Steadfast backend is running."
+    })
+
+
 @app.get("/health")
 def health():
 
     return jsonify({
         "ok": True,
         "service": "steadfast-backend",
-        "credentials_configured": bool(
-            API_KEY and SECRET_KEY
-        ),
+        "credentials_configured": credentials_ok(),
+        "base_url": STEADFAST_BASE_URL
     })
 
 
 # =========================================================
-# GET DISTRICT / THANA LIST
+# DISTRICT + THANA / POLICE STATIONS
 # =========================================================
 
 @app.get("/steadfast/police_stations")
 def police_stations():
 
-    if not API_KEY or not SECRET_KEY:
+    if not credentials_ok():
 
         return jsonify({
             "ok": False,
-            "message": "Steadfast API credentials are not configured."
+            "message": "Steadfast API credentials are not configured on the server."
         }), 500
 
     try:
@@ -139,33 +177,50 @@ def police_stations():
         response = requests.get(
             f"{STEADFAST_BASE_URL}/police_stations",
             headers=steadfast_headers(),
-            timeout=30,
+            timeout=30
         )
+
+        # -------------------------------------------------
+        # TRY JSON
+        # -------------------------------------------------
 
         try:
             result = response.json()
 
         except ValueError:
-            result = {
-                "raw": response.text
-            }
+
+            return jsonify({
+                "ok": False,
+                "message": "Steadfast returned a non-JSON response.",
+                "status_code": response.status_code,
+                "raw": response.text[:2000]
+            }), response.status_code
+
+        # -------------------------------------------------
+        # STEADFAST ERROR
+        # -------------------------------------------------
 
         if not response.ok:
 
             return jsonify({
                 "ok": False,
-                "message": "Could not load Steadfast police stations.",
+                "message": "Steadfast police station request failed.",
                 "steadfast_status": response.status_code,
-                "details": result,
+                "details": result
             }), response.status_code
 
-        return jsonify(result), 200
+        # -------------------------------------------------
+        # NORMAL RESPONSE
+        # -------------------------------------------------
+
+        return jsonify(result), response.status_code
 
     except requests.RequestException as e:
 
         return jsonify({
             "ok": False,
-            "message": f"Could not reach Steadfast: {e}"
+            "message": "Could not reach Steadfast police station API.",
+            "error": str(e)
         }), 502
 
 
@@ -176,19 +231,19 @@ def police_stations():
 @app.post("/steadfast/order")
 def create_order():
 
-    if not API_KEY or not SECRET_KEY:
+    if not credentials_ok():
 
         return jsonify({
             "ok": False,
-            "message": (
-                "Steadfast API credentials are not "
-                "configured on the server."
-            )
+            "message": "Steadfast API credentials are not configured on the server."
         }), 500
 
     data = request.get_json(silent=True) or {}
 
-    # Validate normal order fields
+    # -----------------------------------------------------
+    # VALIDATE
+    # -----------------------------------------------------
+
     error = validate_order(data)
 
     if error:
@@ -199,72 +254,46 @@ def create_order():
         }), 400
 
     # -----------------------------------------------------
-    # CUSTOMER DATA
-    # -----------------------------------------------------
-
-    invoice = clean(data.get("invoice"))
-    customer_name = clean(data.get("customer_name"))
-    customer_phone = clean_phone(
-        data.get("customer_phone")
-    )
-
-    # -----------------------------------------------------
-    # ADDRESS + DISTRICT + THANA
-    # -----------------------------------------------------
-
-    delivery_address = clean(
-        data.get("delivery_address")
-    )
-
-    district = clean(
-        data.get("district")
-    )
-
-    thana = clean(
-        data.get("thana")
-    )
-
-    # Build full address
+    # ADDRESS
+    #
+    # Steadfast's create_order API requires one
+    # recipient_address field.
+    #
+    # We combine:
+    # District + Thana + user's address
     #
     # Example:
-    # Cox bazar notun bari, Ramu, Cox's Bazar
-    #
+    # Cox's Bazar, Ramu, Notun Bari
+    # -----------------------------------------------------
 
-    address_parts = []
+    district = clean(data.get("district"))
+    thana = clean(data.get("thana"))
+    address = clean(data.get("delivery_address"))
 
-    if delivery_address:
-        address_parts.append(delivery_address)
+    full_address = f"{address} | {thana}, {district}"
 
-    if thana:
-        address_parts.append(thana)
-
-    if district:
-        address_parts.append(district)
-
-    full_address = ", ".join(address_parts)
-
-    # Steadfast max address length is 250 characters
+    # Steadfast max address length is 250 characters.
     if len(full_address) > 250:
 
         return jsonify({
             "ok": False,
-            "message": (
-                "Address + Thana + District is too long "
-                "(max 250 characters)."
-            )
+            "message": "Combined delivery address is longer than 250 characters."
         }), 400
 
     # -----------------------------------------------------
-    # STEADFAST PAYLOAD
+    # MAIN PAYLOAD
     # -----------------------------------------------------
 
     payload = {
+        "invoice": clean(data.get("invoice")),
 
-        "invoice": invoice,
+        "recipient_name": clean(
+            data.get("customer_name")
+        ),
 
-        "recipient_name": customer_name,
-
-        "recipient_phone": customer_phone,
+        "recipient_phone": clean_phone(
+            data.get("customer_phone")
+        ),
 
         "recipient_address": full_address,
 
@@ -278,27 +307,27 @@ def create_order():
     # -----------------------------------------------------
 
     optional_fields = [
-
-        ("alternative_phone", "alternative_phone"),
-
-        ("recipient_email", "recipient_email"),
-
-        ("note", "note"),
-
-        ("item_description", "item_description"),
-
-        ("total_lot", "total_lot"),
-
-        ("delivery_type", "delivery_type"),
+        "alternative_phone",
+        "recipient_email",
+        "note",
+        "item_description",
+        "total_lot",
+        "delivery_type",
     ]
 
-    for source, destination in optional_fields:
+    for field in optional_fields:
 
-        value = data.get(source)
+        value = data.get(field)
 
         if value not in (None, ""):
 
-            payload[destination] = value
+            if field == "alternative_phone":
+
+                payload[field] = clean_phone(value)
+
+            else:
+
+                payload[field] = value
 
     # -----------------------------------------------------
     # SEND TO STEADFAST
@@ -307,48 +336,46 @@ def create_order():
     try:
 
         response = requests.post(
-
             f"{STEADFAST_BASE_URL}/create_order",
-
             headers=steadfast_headers(),
-
             json=payload,
-
-            timeout=30,
+            timeout=30
         )
 
-        try:
+        # -------------------------------------------------
+        # JSON RESPONSE
+        # -------------------------------------------------
 
+        try:
             result = response.json()
 
         except ValueError:
 
-            result = {
-                "raw": response.text
-            }
+            return jsonify({
+                "ok": False,
+                "message": "Steadfast returned a non-JSON response.",
+                "steadfast_status": response.status_code,
+                "raw": response.text[:3000]
+            }), response.status_code
+
+        # -------------------------------------------------
+        # STEADFAST ERROR
+        # -------------------------------------------------
 
         if not response.ok:
 
             return jsonify({
-
                 "ok": False,
-
                 "message": "Steadfast API request failed.",
-
                 "steadfast_status": response.status_code,
-
-                "details": result,
-
+                "details": result
             }), response.status_code
 
         # -------------------------------------------------
-        # SUCCESS
+        # CONSIGNMENT
         # -------------------------------------------------
 
-        consignment = (
-            result.get("consignment")
-            or {}
-        )
+        consignment = result.get("consignment") or {}
 
         return jsonify({
 
@@ -359,35 +386,36 @@ def create_order():
                 "Order created successfully."
             ),
 
-            "consignment_id":
-                consignment.get(
-                    "consignment_id"
-                ),
+            "consignment_id": consignment.get(
+                "consignment_id"
+            ),
 
-            "tracking_code":
-                consignment.get(
-                    "tracking_code"
-                ),
+            "tracking_code": consignment.get(
+                "tracking_code"
+            ),
 
-            "status":
-                consignment.get(
-                    "status"
-                ),
+            "status": consignment.get(
+                "status"
+            ),
 
-            "consignment":
-                consignment,
+            "consignment": consignment,
 
-        }), 200
+            # Keep these so frontend can confirm
+            # what was actually sent.
+            "district": district,
+
+            "thana": thana,
+
+            "recipient_address": full_address
+
+        }), response.status_code
 
     except requests.RequestException as e:
 
         return jsonify({
-
             "ok": False,
-
-            "message":
-                f"Could not reach Steadfast: {e}"
-
+            "message": "Could not reach Steadfast.",
+            "error": str(e)
         }), 502
 
 
@@ -398,26 +426,22 @@ def create_order():
 @app.get("/steadfast/status/invoice/<path:invoice>")
 def status_by_invoice(invoice):
 
-    if not API_KEY or not SECRET_KEY:
+    if not credentials_ok():
 
         return jsonify({
             "ok": False,
-            "message": "Steadfast API credentials are not configured."
+            "message": "Steadfast API credentials are not configured on the server."
         }), 500
 
     try:
 
         response = requests.get(
-
             f"{STEADFAST_BASE_URL}/status_by_invoice/{invoice}",
-
             headers=steadfast_headers(),
-
-            timeout=30,
+            timeout=30
         )
 
         try:
-
             result = response.json()
 
         except ValueError:
@@ -431,12 +455,9 @@ def status_by_invoice(invoice):
     except requests.RequestException as e:
 
         return jsonify({
-
             "ok": False,
-
-            "message":
-                f"Could not reach Steadfast: {e}"
-
+            "message": "Could not reach Steadfast.",
+            "error": str(e)
         }), 502
 
 
@@ -447,26 +468,22 @@ def status_by_invoice(invoice):
 @app.get("/steadfast/status/tracking/<tracking_code>")
 def status_by_tracking(tracking_code):
 
-    if not API_KEY or not SECRET_KEY:
+    if not credentials_ok():
 
         return jsonify({
             "ok": False,
-            "message": "Steadfast API credentials are not configured."
+            "message": "Steadfast API credentials are not configured on the server."
         }), 500
 
     try:
 
         response = requests.get(
-
             f"{STEADFAST_BASE_URL}/status_by_trackingcode/{tracking_code}",
-
             headers=steadfast_headers(),
-
-            timeout=30,
+            timeout=30
         )
 
         try:
-
             result = response.json()
 
         except ValueError:
@@ -480,12 +497,93 @@ def status_by_tracking(tracking_code):
     except requests.RequestException as e:
 
         return jsonify({
-
             "ok": False,
+            "message": "Could not reach Steadfast.",
+            "error": str(e)
+        }), 502
 
-            "message":
-                f"Could not reach Steadfast: {e}"
 
+# =========================================================
+# STATUS BY CONSIGNMENT ID
+# =========================================================
+
+@app.get("/steadfast/status/cid/<int:consignment_id>")
+def status_by_cid(consignment_id):
+
+    if not credentials_ok():
+
+        return jsonify({
+            "ok": False,
+            "message": "Steadfast API credentials are not configured on the server."
+        }), 500
+
+    try:
+
+        response = requests.get(
+            f"{STEADFAST_BASE_URL}/status_by_cid/{consignment_id}",
+            headers=steadfast_headers(),
+            timeout=30
+        )
+
+        try:
+            result = response.json()
+
+        except ValueError:
+
+            result = {
+                "raw": response.text
+            }
+
+        return jsonify(result), response.status_code
+
+    except requests.RequestException as e:
+
+        return jsonify({
+            "ok": False,
+            "message": "Could not reach Steadfast.",
+            "error": str(e)
+        }), 502
+
+
+# =========================================================
+# BALANCE
+# =========================================================
+
+@app.get("/steadfast/balance")
+def balance():
+
+    if not credentials_ok():
+
+        return jsonify({
+            "ok": False,
+            "message": "Steadfast API credentials are not configured on the server."
+        }), 500
+
+    try:
+
+        response = requests.get(
+            f"{STEADFAST_BASE_URL}/get_balance",
+            headers=steadfast_headers(),
+            timeout=30
+        )
+
+        try:
+            result = response.json()
+
+        except ValueError:
+
+            result = {
+                "raw": response.text
+            }
+
+        return jsonify(result), response.status_code
+
+    except requests.RequestException as e:
+
+        return jsonify({
+            "ok": False,
+            "message": "Could not reach Steadfast.",
+            "error": str(e)
         }), 502
 
 
